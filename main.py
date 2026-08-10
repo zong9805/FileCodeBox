@@ -29,8 +29,18 @@ from core.database import db_startup_lock, get_db_config, init_db
 from core.logger import logger
 from core.response import APIResponse
 from core.settings import settings, BASE_DIR, DEFAULT_CONFIG
-from core.tasks import delete_expire_files, clean_incomplete_uploads
+from core.tasks import (
+    clean_expired_presign_sessions,
+    clean_incomplete_uploads,
+    delete_expire_files,
+)
 from core.version import APP_VERSION
+
+
+def normalize_public_flag(value) -> int:
+    if isinstance(value, str):
+        return int(value.strip().lower() in {"1", "true", "on", "yes"})
+    return int(bool(value))
 
 
 def build_public_config() -> dict:
@@ -45,7 +55,7 @@ def build_public_config() -> dict:
         "openUpload": settings.openUpload,
         "notify_title": settings.notify_title,
         "notify_content": settings.notify_content,
-        "show_admin_address": settings.showAdminAddr,
+        "show_admin_address": normalize_public_flag(settings.showAdminAddr),
         "max_save_seconds": settings.max_save_seconds,
     }
 
@@ -61,7 +71,7 @@ def build_public_meta() -> dict:
         "features": {
             "chunkUpload": bool(settings.enableChunk),
             "guestUpload": bool(settings.openUpload),
-            "adminAddressVisible": bool(settings.showAdminAddr),
+            "adminAddressVisible": bool(normalize_public_flag(settings.showAdminAddr)),
             "expirationModes": settings.expireStyle,
         },
         "limits": {
@@ -153,7 +163,9 @@ def parse_setup_options(data: dict) -> dict:
     if not expire_styles:
         raise ValueError("至少需要选择一种过期方式")
 
-    code_generate_type = get_form_value(data, "code_generate_type", "number")
+    code_generate_type = get_form_value(
+        data, "code_generate_type", DEFAULT_CONFIG["code_generate_type"]
+    )
     if code_generate_type not in {"number", "secret"}:
         raise ValueError("提取码类型不正确")
 
@@ -168,6 +180,12 @@ def parse_setup_options(data: dict) -> dict:
         ),
         "errorMinute": parse_int_field(
             data, "errorMinute", DEFAULT_CONFIG["errorMinute"], "取件错误检测窗口", 1
+        ),
+        "loginCount": parse_int_field(
+            data, "loginCount", DEFAULT_CONFIG["loginCount"], "登录失败次数限制", 1
+        ),
+        "loginMinute": parse_int_field(
+            data, "loginMinute", DEFAULT_CONFIG["loginMinute"], "登录失败检测窗口", 1
         ),
         "expireStyle": expire_styles,
         "max_save_seconds": save_time_value * SAVE_TIME_UNITS[save_time_unit],
@@ -216,13 +234,21 @@ def build_setup_page(error: str = "", form: dict | None = None) -> str:
     error_count = html.escape(
         get_form_value(form, "errorCount", str(DEFAULT_CONFIG["errorCount"]))
     )
+    login_minute = html.escape(
+        get_form_value(form, "loginMinute", str(DEFAULT_CONFIG["loginMinute"]))
+    )
+    login_count = html.escape(
+        get_form_value(form, "loginCount", str(DEFAULT_CONFIG["loginCount"]))
+    )
     open_upload_checked = (
         " checked" if normalize_bool_field(form, "openUpload", True) else ""
     )
     chunk_checked = (
         " checked" if normalize_bool_field(form, "enableChunk", False) else ""
     )
-    code_generate_type = get_form_value(form, "code_generate_type", "number")
+    code_generate_type = get_form_value(
+        form, "code_generate_type", DEFAULT_CONFIG["code_generate_type"]
+    )
     selected_expire_styles = get_form_list(form, "expireStyle") or list(
         DEFAULT_CONFIG["expireStyle"]
     )
@@ -562,6 +588,12 @@ def build_setup_page(error: str = "", form: dict | None = None) -> str:
             <input name="errorMinute" type="number" min="1" value="{error_minute}" aria-label="取件错误检测窗口分钟" required>
           </div>
 
+          <label for="loginCount">管理员登录失败频率 <span class="compact-help">次数 / 分钟</span></label>
+          <div class="row">
+            <input id="loginCount" name="loginCount" type="number" min="1" value="{login_count}" required>
+            <input name="loginMinute" type="number" min="1" value="{login_minute}" aria-label="登录失败检测窗口分钟" required>
+          </div>
+
           <label for="save_time_value">最长保存时间</label>
           <div class="row">
             <input id="save_time_value" name="save_time_value" type="number" min="0" value="{save_time_value}" required>
@@ -697,6 +729,7 @@ async def lifespan(app: FastAPI):
     # 启动后台任务
     task = asyncio.create_task(delete_expire_files())
     chunk_cleanup_task = asyncio.create_task(clean_incomplete_uploads())
+    presign_cleanup_task = asyncio.create_task(clean_expired_presign_sessions())
     logger.info("应用初始化完成")
 
     try:
@@ -706,7 +739,13 @@ async def lifespan(app: FastAPI):
         logger.info("正在关闭应用...")
         task.cancel()
         chunk_cleanup_task.cancel()
-        await asyncio.gather(task, chunk_cleanup_task, return_exceptions=True)
+        presign_cleanup_task.cancel()
+        await asyncio.gather(
+            task,
+            chunk_cleanup_task,
+            presign_cleanup_task,
+            return_exceptions=True,
+        )
         await Tortoise.close_connections()
         logger.info("应用已关闭")
 
@@ -723,8 +762,10 @@ async def load_config():
     ip_limit["error"].count = settings.errorCount
     ip_limit["upload"].minutes = settings.uploadMinute
     ip_limit["upload"].count = settings.uploadCount
+    ip_limit["login"].minutes = settings.loginMinute
+    ip_limit["login"].count = settings.loginCount
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan, version=APP_VERSION)
 
 @app.middleware("http")
 async def refresh_settings_middleware(request, call_next):
@@ -746,7 +787,9 @@ async def refresh_settings_middleware(request, call_next):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    # 前端使用 Bearer Token，不依赖 Cookie credentials。
+    # allow_origins=["*"] 与 allow_credentials=True 组合不符合 CORS 规范。
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

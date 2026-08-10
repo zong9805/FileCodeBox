@@ -4,6 +4,10 @@
 # @Software: PyCharm
 from pathlib import Path
 
+ADMIN_SESSION_EXPIRE_DEFAULT = 30 * 24 * 60 * 60
+ADMIN_SESSION_EXPIRE_MIN = 24 * 60 * 60
+ADMIN_SESSION_EXPIRE_MAX = 365 * 24 * 60 * 60
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 data_root = BASE_DIR / "data"
 
@@ -13,6 +17,7 @@ if not data_root.exists():
 DEFAULT_CONFIG = {
     "file_storage": "local",
     "storage_path": "",
+    "storageLimit": 0,
     "name": "文件快递柜 - FileCodeBox",
     "description": "开箱即用的文件快传系统",
     "notify_title": "系统通知",
@@ -40,11 +45,12 @@ DEFAULT_CONFIG = {
     "webdav_proxy": 0,
     "admin_token": "",
     "jwt_secret": "",
+    "adminSessionExpire": ADMIN_SESSION_EXPIRE_DEFAULT,
     "openUpload": 1,
     "uploadSize": 1024 * 1024 * 10,
     "allowed_file_types": ["*"],
     "expireStyle": ["day", "hour", "minute", "forever", "count"],
-    "code_generate_type": "number",
+    "code_generate_type": "secret",
     "uploadMinute": 1,
     "enableChunk": 0,
     "webdav_url": "",
@@ -70,6 +76,8 @@ DEFAULT_CONFIG = {
     "themesSelect": "themes/2024",
     "errorMinute": 1,
     "errorCount": 10,
+    "loginCount": 5,
+    "loginMinute": 15,
     "serverWorkers": 1,
     "serverHost": "0.0.0.0",
     "serverPort": 12345,

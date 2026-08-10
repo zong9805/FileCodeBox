@@ -8,7 +8,12 @@ import base64
 import hmac
 import json
 import time
-from core.settings import settings
+from core.settings import (
+    ADMIN_SESSION_EXPIRE_DEFAULT,
+    ADMIN_SESSION_EXPIRE_MAX,
+    ADMIN_SESSION_EXPIRE_MIN,
+    settings,
+)
 from apps.admin.services import FileService, ConfigService, LocalFileService
 
 
@@ -19,21 +24,44 @@ def _get_jwt_secret() -> bytes:
     return secret.encode()
 
 
-def create_token(data: dict, expires_in: int = 3600 * 24 * 30) -> str:
+def get_admin_session_expire_seconds() -> int:
+    try:
+        expires_in = int(
+            getattr(settings, "adminSessionExpire", ADMIN_SESSION_EXPIRE_DEFAULT)
+        )
+    except (TypeError, ValueError):
+        return ADMIN_SESSION_EXPIRE_DEFAULT
+    if (
+        not ADMIN_SESSION_EXPIRE_MIN <= expires_in <= ADMIN_SESSION_EXPIRE_MAX
+        or expires_in % ADMIN_SESSION_EXPIRE_MIN != 0
+    ):
+        return ADMIN_SESSION_EXPIRE_DEFAULT
+    return expires_in
+
+
+def create_token(data: dict, expires_in: int | None = None) -> str:
     """
     创建JWT token
     :param data: 数据负载
     :param expires_in: 过期时间(秒)
     """
-    header = base64.b64encode(
-        json.dumps({"alg": "HS256", "typ": "JWT"}).encode()
-    ).decode()
-    payload = base64.b64encode(
-        json.dumps({**data, "exp": int(time.time()) + expires_in}).encode()
-    ).decode()
+    token_lifetime = (
+        get_admin_session_expire_seconds() if expires_in is None else expires_in
+    )
+    header = base64.urlsafe_b64encode(
+        json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode()
+    ).decode().rstrip("=")
+    payload = base64.urlsafe_b64encode(
+        json.dumps(
+            {**data, "exp": int(time.time()) + token_lifetime},
+            separators=(",", ":"),
+        ).encode()
+    ).decode().rstrip("=")
 
-    signature = hmac.new(_get_jwt_secret(), f"{header}.{payload}".encode(), "sha256").digest()
-    signature = base64.b64encode(signature).decode()
+    signature = hmac.new(
+        _get_jwt_secret(), f"{header}.{payload}".encode(), "sha256"
+    ).digest()
+    signature = base64.urlsafe_b64encode(signature).decode().rstrip("=")
 
     return f"{header}.{payload}.{signature}"
 
@@ -53,13 +81,20 @@ def verify_token(token: str) -> dict:
             f"{header_b64}.{payload_b64}".encode(),
             "sha256",
         ).digest()
-        expected_signature_b64 = base64.b64encode(expected_signature).decode()
+        expected_signature_b64 = (
+            base64.urlsafe_b64encode(expected_signature).decode().rstrip("=")
+        )
 
         if not hmac.compare_digest(signature_b64, expected_signature_b64):
             raise ValueError("无效的签名")
 
-        # 解码payload
-        payload = json.loads(base64.b64decode(payload_b64))
+        # 解码payload（兼容历史标准 base64 与 urlsafe base64）
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        try:
+            payload_bytes = base64.urlsafe_b64decode(padded)
+        except Exception:
+            payload_bytes = base64.b64decode(padded)
+        payload = json.loads(payload_bytes)
 
         # 检查是否过期
         if payload.get("exp", 0) < time.time():

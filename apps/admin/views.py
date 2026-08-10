@@ -31,9 +31,14 @@ from apps.admin.schemas import (
 )
 from core.response import APIResponse
 from apps.base.models import FileCodes, KeyValue
-from apps.admin.dependencies import create_token
+from apps.admin.dependencies import (
+    create_token,
+    get_admin_session_expire_seconds,
+    verify_token,
+)
 from core.settings import settings
 from core.utils import get_now, verify_password
+from apps.base.utils import ip_limit
 
 admin_api = APIRouter(
     prefix="/admin", tags=["管理"], dependencies=[Depends(admin_required)]
@@ -49,12 +54,24 @@ def _pick_query_text(*values: Optional[str]) -> Optional[str]:
 
 
 @admin_api.post("/login")
-async def login(data: LoginData):
+async def login(data: LoginData, ip: str = Depends(ip_limit["login"])):
+    # 登录失败计入 IP 频率限制，超过 loginCount/loginMinute 后暂时锁定
     if not verify_password(data.password, settings.admin_token):
+        ip_limit["login"].add_ip(ip)
         raise HTTPException(status_code=401, detail="密码错误")
 
-    token = create_token({"is_admin": True})
-    return APIResponse(detail={"token": token, "token_type": "Bearer"})
+    expires_in = get_admin_session_expire_seconds()
+    token = create_token({"is_admin": True}, expires_in=expires_in)
+    return APIResponse(
+        detail={
+            "id": "admin",
+            "username": "admin",
+            "token": token,
+            "token_type": "Bearer",
+            "expires_at": verify_token(token)["exp"],
+            "expires_in": expires_in,
+        }
+    )
 
 
 @admin_api.get("/verify")

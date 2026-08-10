@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://fastly.jsdelivr.net/gh/vastsa/FileCodeBox@V1.6/static/banners/img_1.png" alt="FileCodeBox Logo">
+<img src="/screenshots/retrieve.webp" alt="FileCodeBox" width="860" />
 
 <p><em>Share text and files anonymously with a passcode, like picking up a package</em></p>
 
@@ -136,7 +136,7 @@ Command-line download
 ### Docker Deployment
 
 ```bash
-docker run -d --restart=always -p 12345:12345 -v /opt/FileCodeBox/:/app/data --name filecodebox lanol/filecodebox:beta
+docker run -d --restart unless-stopped -p 12345:12345 -v fcb-data:/app/data --name filecodebox lanol/filecodebox:latest
 ```
 
 ### Manual Deployment

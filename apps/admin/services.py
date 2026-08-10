@@ -1,16 +1,23 @@
 import hashlib
+from pathlib import Path
 import os
 import time
+import uuid
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from core.response import APIResponse
 from core.storage import FileStorageInterface, storages
-from core.settings import settings
+from core.settings import (
+    ADMIN_SESSION_EXPIRE_MAX,
+    ADMIN_SESSION_EXPIRE_MIN,
+    settings,
+)
 from core.config import refresh_settings
 from core.security import INTERNAL_CONFIG_KEYS, generate_jwt_secret
 from apps.base.models import FileCodes, KeyValue
 from apps.base.utils import get_expire_info, get_file_path_name
+from apps.base.quota import release_storage, reserve_storage
 from fastapi import HTTPException
 from core.settings import data_root
 from core.utils import get_now, hash_password, is_password_hashed
@@ -1468,25 +1475,36 @@ class FileService:
         if not await local_file.exists():
             raise HTTPException(status_code=404, detail="文件不存在")
 
-        text = await local_file.read()
-        expired_at, expired_count, used_count, code = await get_expire_info(
-            item.expire_value, item.expire_style
-        )
-        path, suffix, prefix, uuid_file_name, save_path = await get_file_path_name(item)
-
-        await self.file_storage.save_file(text, save_path)
-
-        await FileCodes.create(
-            code=code,
-            prefix=prefix,
-            suffix=suffix,
-            uuid_file_name=uuid_file_name,
-            file_path=path,
-            size=local_file.size,
-            expired_at=expired_at,
-            expired_count=expired_count,
-            used_count=used_count,
-        )
+        reservation_token = f"local:{uuid.uuid4().hex}"
+        await reserve_storage(reservation_token, local_file.size, ttl_seconds=3600)
+        try:
+            text = await local_file.read()
+            expired_at, expired_count, used_count, code = await get_expire_info(
+                item.expire_value, item.expire_style
+            )
+            path, suffix, prefix, uuid_file_name, save_path = await get_file_path_name(
+                item
+            )
+            await self.file_storage.save_file(text, save_path)
+            try:
+                await FileCodes.create(
+                    code=code,
+                    prefix=prefix,
+                    suffix=suffix,
+                    uuid_file_name=uuid_file_name,
+                    file_path=path,
+                    size=local_file.size,
+                    expired_at=expired_at,
+                    expired_count=expired_count,
+                    used_count=used_count,
+                )
+            except Exception:
+                await self.file_storage.delete_file(
+                    FileCodes(file_path=path, uuid_file_name=uuid_file_name)
+                )
+                raise
+        finally:
+            await release_storage(reservation_token)
 
         return {
             "code": code,
@@ -1496,9 +1514,12 @@ class FileService:
 
 class ConfigService:
     INT_FIELDS = {
+        "adminSessionExpire",
         "enableChunk",
         "errorCount",
         "errorMinute",
+        "loginCount",
+        "loginMinute",
         "max_save_seconds",
         "onedrive_proxy",
         "openUpload",
@@ -1507,6 +1528,7 @@ class ConfigService:
         "serverPort",
         "serverWorkers",
         "showAdminAddr",
+        "storageLimit",
         "uploadCount",
         "uploadMinute",
         "uploadSize",
@@ -1554,6 +1576,29 @@ class ConfigService:
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400, detail=f"{key} 配置值格式错误")
 
+        try:
+            session_expire = int(next_config.get("adminSessionExpire"))
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="adminSessionExpire 配置值格式错误",
+            )
+        if (
+            not ADMIN_SESSION_EXPIRE_MIN <= session_expire <= ADMIN_SESSION_EXPIRE_MAX
+            or session_expire % ADMIN_SESSION_EXPIRE_MIN != 0
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="adminSessionExpire 必须是 1 到 365 个整天",
+            )
+        next_config["adminSessionExpire"] = session_expire
+
+        if int(next_config.get("storageLimit", 0)) < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="storageLimit 不能小于 0",
+            )
+
         if admin_password_changed:
             next_config["jwt_secret"] = generate_jwt_secret()
 
@@ -1585,9 +1630,35 @@ class LocalFileService:
 
 class LocalFileClass:
     def __init__(self, file):
-        self.file = file
-        self.path = data_root / "local" / file
-        if os.path.exists(self.path):
+        # 仅允许 data/local 目录下的单层文件名，阻断路径穿越与绝对路径访问。
+        raw_name = str(file or "")
+        normalized = Path(raw_name).as_posix()
+        # 输入本身不得包含路径分隔符或绝对路径形态。
+        if (
+            not raw_name
+            or raw_name in {".", ".."}
+            or normalized in {".", ".."}
+            or "/" in normalized
+            or normalized.startswith("~")
+            or Path(raw_name).is_absolute()
+            or Path(raw_name).name != raw_name
+        ):
+            raise HTTPException(status_code=400, detail="非法文件名")
+
+        safe_name = Path(raw_name).name
+        if not safe_name or safe_name in {".", ".."}:
+            raise HTTPException(status_code=400, detail="非法文件名")
+
+        local_root = (data_root / "local").resolve()
+        candidate = (local_root / safe_name).resolve()
+        try:
+            candidate.relative_to(local_root)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="非法文件路径")
+
+        self.file = safe_name
+        self.path = candidate
+        if self.path.is_file():
             self.ctime = time.strftime(
                 "%Y-%m-%d %H:%M:%S", time.localtime(os.path.getctime(self.path))
             )
@@ -1607,4 +1678,4 @@ class LocalFileClass:
         os.remove(self.path)
 
     async def exists(self):
-        return os.path.exists(self.path)
+        return self.path.is_file()

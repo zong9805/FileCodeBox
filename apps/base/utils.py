@@ -19,6 +19,13 @@ from core.utils import (
 )
 
 
+def validate_expire_style(expire_style: str) -> str:
+    """校验过期方式是否在管理员配置的白名单内。"""
+    if expire_style not in settings.expireStyle:
+        raise HTTPException(status_code=400, detail="过期时间类型错误")
+    return expire_style
+
+
 async def get_file_path_name(file: UploadFile) -> Tuple[str, str, str, str, str]:
     today = await get_now()
     storage_path = settings.storage_path.strip("/")
@@ -90,7 +97,7 @@ async def get_expire_info(
 
 
 def get_code_generate_type() -> str:
-    code_generate_type = getattr(settings, "code_generate_type", "number")
+    code_generate_type = getattr(settings, "code_generate_type", "secret")
     if code_generate_type in {"secret", "string"}:
         return "secret"
     return "number"
@@ -127,5 +134,7 @@ async def calculate_file_hash(file: UploadFile, chunk_size=1024 * 1024) -> str:
 
 ip_limit = {
     "error": IPRateLimit(count=settings.errorCount, minutes=settings.errorMinute),
+    "metadata": IPRateLimit(count=settings.errorCount, minutes=settings.errorMinute),
     "upload": IPRateLimit(count=settings.uploadCount, minutes=settings.uploadMinute),
+    "login": IPRateLimit(count=settings.loginCount, minutes=settings.loginMinute),
 }
